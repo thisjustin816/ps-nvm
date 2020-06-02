@@ -75,97 +75,125 @@ function Set-NodeVersion {
         $Persist
     )
 
-    process {
-        if ($SemVer) {
-            $Version = $SemVer.ToString()
-        }
-        if ([string]::IsNullOrEmpty($Version)) {
-            if (Test-Path ./.nvmrc) {
-                $Version = Get-Content ./.nvmrc -Raw
-            }
-            elseif (Test-Path ./package.json) {
-                $packageJson = Get-Content ./package.json -Raw | ConvertFrom-Json
-                if ((Get-Member -InputObject $packageJson -Name 'engines') -and (Get-Member -InputObject $packageJson.engines -Name 'node')) {
-                    # Use node engine field as version range
-                    $Version = $packageJson.engines.node
-                }
-                else {
-                    throw "Version not given, no .nvmrc found in folder and package.json does not contain node engines field"
-                }
-            }
-            else {
-                throw "Version not given and no .nvmrc or package.json found in folder"
-            }
-        }
+    if ($SemVer) {
+        $Version = $SemVer.ToString()
+    }
 
-        # The version returned from Install-NodeVersion includes an extra octet so it should be removed
-        $Version = $Version.Trim() -replace ('(?<=v?\d+\.\d+\.\d+)(\.0)+', '')
+    $Version = Get-TargetNodeVersion($Version).Trim()
 
-        $matchedVersion = if (!($Version -match "v\d+\.\d+\.\d+")) {
-            Get-NodeVersions -Filter $Version | Select-Object -First 1
+    $matchedVersion = if (!($Version -match "v\d+\.\d+\.\d+")) {
+        Get-NodeVersions -Filter $Version | Select-Object -First 1
+    }
+    else {
+        $Version
+    }
+
+    if (!$matchedVersion) {
+        throw "No version found that matches $Version"
+    }
+
+    $nvmPath = Get-NodeInstallLocation
+
+    $requestedVersion = Join-Path $nvmPath $matchedVersion
+    $binPath = if ((IsMac) -or (IsLinux)) {
+        # Under macOS, the node binary is in a bin folder
+        Join-Path $requestedVersion "bin"
+    }
+    else {
+        $requestedVersion
+    }
+
+    # If the requested version is already reachable (and first priority in the PATH),
+    # return early to not clutter the PATH with duplicate entries
+    # and only log "switched ..." when the version was actually switched.
+    # This makes it save to put Set-NodeVersion in the prompt function
+    try {
+        if ((Get-Command node -CommandType Application -ErrorAction SilentlyContinue).Source -eq (Join-Path $binPath 'node')) {
+            Write-Verbose "Version $requestedVersion already set"
+            return
+        }
+    }
+    catch {
+        # node is not in PATH yet, ignore
+        Write-Verbose -Message 'PATH does not contain node.'
+    }
+
+    # separator
+    $separator = [System.IO.Path]::PathSeparator
+
+    # get PATH entries without nvm-install paths
+    $nonNvmPath = ($env:PATH -split $separator | Where-Object { -not $_.StartsWith($nvmPath) }) -join $separator
+
+    # immediately add to the current powershell session path
+    # NOTE: it's important to use uppercase PATH for Unix systems as env vars
+    # are case-sensitive on Unix but case-insensitive on Windows
+    $env:PATH = @($binPath, $nonNvmPath) -join $separator
+    $env:NPM_CONFIG_GLOBALCONFIG = (Join-Path $binPath npmrc)
+
+    # make the path persistent (only on windows)
+    if ($Persist -ne '') {
+        if (-not ((IsMac) -or (IsLinux))) {
+            $originalPath = [Environment]::GetEnvironmentVariable('PATH', $Persist)
+            $cleanedPath = ($originalPath -split $separator | Where-Object { -not $_.StartsWith($nvmPath) }) -join $separator
+            [Environment]::SetEnvironmentVariable('PATH', (@($binPath, $cleanedPath) -join $separator), $Persist)
+            [Environment]::SetEnvironmentVariable('NPM_CONFIG_GLOBALCONFIG', (Join-Path $binPath npmrc), $Persist)
         }
         else {
-            $Version
+            Add-NvmToProfile $Version $Persist
         }
+    }
 
-        if (!$matchedVersion) {
-            throw "No version found that matches $Version"
+    Write-Information "Switched to node version $matchedVersion"
+
+}
+
+function Get-TargetNodeVersion($Version) {
+
+    if (![string]::IsNullOrEmpty($Version)) {
+        return $Version
+    }
+
+    if (Test-Path ./.nvmrc) {
+        return Get-Content ./.nvmrc -Raw
+    }
+
+    if (Test-Path ./package.json) {
+        $packageJson = Get-Content ./package.json -Raw | ConvertFrom-Json
+        if ((Get-Member -InputObject $packageJson -Name 'engines') -and (Get-Member -InputObject $packageJson.engines -Name 'node')) {
+            # Use node engine field as version range
+            return $packageJson.engines.node
         }
+    }
 
-        $nvmPath = Get-NodeInstallLocation
+    $vsDefault = Join-Path (Get-NodeInstallLocation) "default"
+    if (Test-Path $vsDefault) {
+        return Get-Content $vsDefault -Raw
+    }
 
-        $requestedVersion = Join-Path $nvmPath $matchedVersion
-        $binPath = if ((IsMac) -or (IsLinux)) {
-            # Under macOS, the node binary is in a bin folder
-            Join-Path $requestedVersion "bin"
-        }
-        else {
-            $requestedVersion
-        }
+    throw "Version not given, no .nvmrc found in folder, and package.json missing or does not contain node engines field"
+}
 
-        # If the requested version is already reachable (and first priority in the PATH),
-        # return early to not clutter the PATH with duplicate entries
-        # and only log "switched ..." when the version was actually switched.
-        # This makes it save to put Set-NodeVersion in the prompt function
-        try {
-            if ((Get-Command node -CommandType Application -ErrorAction SilentlyContinue).Source -eq (Join-Path $binPath 'node')) {
-                Write-Verbose "Version $requestedVersion already set"
-                return
-            }
-        }
-        catch {
-            # node is not in PATH yet, ignore
-            Write-Verbose -Message 'PATH does not contain node.'
-        }
+function Add-NvmToProfile {
+    param(
+        [string]
+        $Version,
+        [ValidateSet('User', 'Machine')]
+        $Scope
+    )
 
-        # separator
-        $separator = [System.IO.Path]::PathSeparator
+    # Write default version number
+    $vsDefault = Join-Path (Get-NodeInstallLocation) "default"
+    $Version | Set-Content $vsDefault
 
-        # get PATH entries without nvm-install paths
-        $nonNvmPath = ($env:PATH -split $separator | Where-Object { -not $_.StartsWith($nvmPath) }) -join $separator
+    # Add command to profile script
+    $targetProfile = $Profile.CurrentUserCurrentHost
+    if ($Scope -eq 'Machine') {
+        $targetProfile = $Profile.AllUsersCurrentHost
+    }
 
-        # immediately add to the current powershell session path
-        # NOTE: it's important to use uppercase PATH for Unix systems as env vars
-        # are case-sensitive on Unix but case-insensitive on Windows
-        $env:PATH = @($binPath, $nonNvmPath) -join $separator
-        $env:NPM_CONFIG_GLOBALCONFIG=(Join-Path $binPath npmrc)
-
-        # make the path persistent (only on windows)
-        if ($Persist -ne '') {
-            if (-not ((IsMac) -or (IsLinux)))
-            {
-                $originalPath = [Environment]::GetEnvironmentVariable('PATH', $Persist)
-                $cleanedPath = ($originalPath -split $separator | Where-Object { -not $_.StartsWith($nvmPath) }) -join $separator
-                [Environment]::SetEnvironmentVariable('PATH', (@($binPath, $cleanedPath) -join $separator), $Persist)
-                [Environment]::SetEnvironmentVariable('NPM_CONFIG_GLOBALCONFIG', (Join-Path $binPath npmrc), $Persist)
-            }
-            else
-            {
-                # ignore this request on linux and mac
-            }
-        }
-
-        Write-Information "Switched to node version $matchedVersion"
+    $profileSrc = if (Test-Path $targetProfile) { Get-Content $targetProfile } else { "" }
+    if (!($profileSrc.Contains("Set-NodeVersion"))) {
+        "`n# nvm`nSet-NodeVersion" | Add-Content $targetProfile
     }
 }
 
@@ -223,23 +251,7 @@ function Install-NodeVersion {
     $ProgressPreference = 'SilentlyContinue'
 
     if ([string]::IsNullOrEmpty($Version)) {
-        $Version = @()
-        if (Test-Path ./.nvmrc) {
-            $Version += Get-Content ./.nvmrc -Raw
-        }
-        elseif (Test-Path ./package.json) {
-            $packageJson = Get-Content ./package.json -Raw | ConvertFrom-Json
-            if ((Get-Member -InputObject $packageJson -Name 'engines') -and (Get-Member -InputObject $packageJson.engines -Name 'node')) {
-                # Use node engine field as version range
-                $Version += $packageJson.engines.node
-            }
-            else {
-                throw "Version not given, no .nvmrc found in folder and package.json does not contain node engines field"
-            }
-        }
-        else {
-            throw "Version not given and no .nvmrc or package.json found in folder"
-        }
+        $Version = @(Get-TargetNodeVersion $Version $false)
     }
 
     foreach ($versionNumber in $Version) {
@@ -324,7 +336,7 @@ function Install-NodeVersion {
         $ProgressPreference = $CurrentProgressPreference
 
         # Make the unpack directory short to comply with Windows's 260 character path limit
-        $unpackPath = Join-Path $env:SystemDrive ".nu-$matchedVersion"
+        $unpackPath = Join-Path $versionPath '.u'
         Remove-Item $unpackPath -Force -Recurse -ErrorAction SilentlyContinue
         New-Item $unpackPath -ItemType Directory | Out-Null
 
@@ -334,6 +346,10 @@ function Install-NodeVersion {
             tar -zxf $outFile --directory $unpackPath --strip=1
             Remove-Item -Force $outFile
             Move-Item (Join-Path $unpackPath '*') -Destination $versionPath -Force
+
+            # Ensure installation actually completed
+            Get-Command (Join-Path (Join-Path $versionPath 'bin') 'node')
+
         }
         elseif (IsWindows) {
             if (-Not (Get-Command msiexec)) {
@@ -356,15 +372,14 @@ function Install-NodeVersion {
             }
 
             Move-Item (Join-Path (Join-Path $unpackPath 'nodejs') '*') -Destination $versionPath -Force
-        }
 
-        # Ensure installation actually completed
-        Get-Command ( Join-Path $versionPath 'node' )
+            # Ensure installation actually completed
+            Get-Command (Join-Path $versionPath 'node.exe')
+        }
 
         Set-Content -Value "prefix=$versionPath" -Path (Join-Path $versionPath npmrc)
 
         Remove-Item $unpackPath -Recurse -Force
-        Remove-Item ( Join-Path $env:SystemDrive '.nu-*' ) -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -450,11 +465,8 @@ function Get-NodeVersions {
     else {
         $nvmPath = Get-NodeInstallLocation
 
-        if ( Test-Path -Path $nvmPath ) {
-            $localVersions = ( Get-ChildItem $nvmPath | Get-ChildItem -Filter 'node.*' ).VersionInfo.ProductVersion
-            foreach ($version in $localVersions) {
-                [SemVer.Version]::new("v$version", $true)
-            }
+        if (Test-Path -Path $nvmPath) {
+            Get-ChildItem $nvmPath -Attributes Directory | ForEach-Object { [SemVer.Version]::new($_.Name, $true) }
         }
     }
 
