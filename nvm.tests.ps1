@@ -1,3 +1,4 @@
+Remove-Module nvm -Force -ErrorAction SilentlyContinue
 Import-Module ./nvm.psd1
 
 Describe "Get-NodeVersions" {
@@ -8,10 +9,22 @@ Describe "Get-NodeVersions" {
                 Mock Get-NodeInstallLocation { Join-Path $tmpDir '.nvm\settings.json' }
                 Mock Test-Path { return $true }
                 Mock Get-ChildItem {
-                    $ret = @()
-                    $ret += @{ Name = 'v8.9.0' }
-                    $ret += @{ Name = 'v9.0.0' }
-                    return $ret
+                    [PSCustomObject]@{
+                        Name = 'v8.9.0'
+                        Path = "$Path\v8.9.0"
+                    }
+                    [PSCustomObject]@{
+                        Name = 'v9.0.0'
+                        Path = "$Path\v9.0.0"
+                    }
+                }
+                Mock Get-ChildItem -ParameterFilter { $Filter -match 'node' } {
+                    [PSCustomObject]@{
+                        Name        = 'node.exe'
+                        VersionInfo = [PSCustomObject]@{
+                            ProductVersion = ( Split-Path -Path $Path -Leaf ).Replace('v', '')
+                        }
+                    }
                 }
 
                 $versions = Get-NodeVersions
@@ -24,10 +37,22 @@ Describe "Get-NodeVersions" {
                 Mock Get-NodeInstallLocation { Join-Path $tmpDir '.nvm\settings.json' }
                 Mock Test-Path { return $true }
                 Mock Get-ChildItem {
-                    $ret = @()
-                    $ret += @{ Name = 'v8.9.0' }
-                    $ret += @{ Name = 'v9.0.0' }
-                    return $ret
+                    [PSCustomObject]@{
+                        Name = 'v8.9.0'
+                        Path = "$Path\v8.9.0"
+                    }
+                    [PSCustomObject]@{
+                        Name = 'v9.0.0'
+                        Path = "$Path\v9.0.0"
+                    }
+                }
+                Mock Get-ChildItem -ParameterFilter { $Filter -match 'node' } {
+                    [PSCustomObject]@{
+                        Name        = 'node.exe'
+                        VersionInfo = [PSCustomObject]@{
+                            ProductVersion = ( Split-Path -Path $Path -Leaf ).Replace('v', '')
+                        }
+                    }
                 }
 
                 $versions = Get-NodeVersions -Filter 'v8.9.0'
@@ -90,7 +115,9 @@ Describe "Get-NodeInstallLocation" {
 Describe "Install-NodeVersion" {
     InModuleScope nvm {
         Context "auto-discovery" {
-            $nodeVersion = 'v9.0.0'
+            BeforeEach {
+                $nodeVersion = 'v9.0.0'
+            }
 
             It "Install version from the .nvmrc file" -Skip:($env:include_integration_tests -ne $true) {
                 Mock Test-Path -ParameterFilter { $Path -match '.nvmrc$' } { return $true }
@@ -129,14 +156,16 @@ Describe "Install-NodeVersion" {
                     } | ConvertTo-Json
                 }
 
-                { Install-NodeVersion } | Should Throw
+                { Install-NodeVersion } | Should -Throw
             }
 
-            It "Will error if no version, no .nvmrc and no package.json" -Skip:($env:include_integration_tests -ne $true) {
+            It "Will error if no version, no .nvmrc and no package.json, no default" -Skip:($env:include_integration_tests -ne $true) {
+                Mock Get-NodeInstallLocation { return "/" }
+                Mock Test-Path -ParameterFilter { $Path -eq '/default' } { return $false }
                 Mock Test-Path -ParameterFilter { $Path -match '.nvmrc$' } { return $false }
                 Mock Test-Path -ParameterFilter { $Path -match 'package.json$' } { return $false }
 
-                { Install-NodeVersion } | Should Throw "Version not given and no .nvmrc or package.json found in folder"
+                { Install-NodeVersion } | Should -Throw "Version not given, no .nvmrc found in folder, and package.json missing or does not contain node engines field"
             }
         }
 
@@ -150,15 +179,19 @@ Describe "Install-NodeVersion" {
 
             It "Throws when version already exists" -Skip:($env:include_integration_tests -ne $true) {
                 Install-NodeVersion -Version 'v9.0.0'
-                { Install-NodeVersion -Version 'v9.0.0' } | Should Throw
+                { Install-NodeVersion -Version 'v9.0.0' } | Should -Throw
             }
 
             It "Won't throw when version already exists if you use the -Force flag" -Skip:($env:include_integration_tests -ne $true) {
-                { Install-NodeVersion -Version 'v9.0.0' -Force } | Should Not Throw
+                { Install-NodeVersion -Version 'v9.0.0' -Force } | Should -Not -Throw
             }
 
             It "Can install without a 'v' prefix" -Skip:($env:include_integration_tests -ne $true) {
-                { Install-NodeVersion -Version '9.0.0' -Force } | Should Not Throw
+                { Install-NodeVersion -Version '9.0.0' -Force } | Should -Not -Throw
+            }
+
+            It "Can install multiple versions" -Skip:($env:include_integration_tests -ne $true) {
+                { Install-NodeVersion -Version '10.0.0', '11.0.0' } | Should -Not -Throw
             }
         }
 
@@ -188,10 +221,27 @@ Describe "Install-NodeVersion" {
                 $versions.GetType() | Should -Be 'SemVer.Version'
             }
         }
+
+        Context "Incomplete installation" {
+            BeforeEach {
+                Mock Get-Command -ParameterFilter { $Name -match 'node' -or $Name -match 'npm' } {
+                    throw (
+                        "The term '$Name' is not recognized as the name of a cmdlet, function, script file, or " +
+                        "operable program. Check the spelling of the name, or if a path was included, verify that " +
+                        "the path is correct and try again."
+                    )
+                }
+            }
+
+            It "Will error if node or npm can't be called" -Skip:($env:include_integration_tests -ne $true) {
+                { Install-NodeVersion latest } | Should -Throw
+            }
+        }
     }
 
     BeforeEach {
-        $installLocation = Join-Path ([system.io.path]::GetTempPath()) '.nvm'
+        $basePath = if ($IsWindows) { $env:SystemDrive } else { [system.io.path]::GetTempPath() }
+        $installLocation = Join-Path $basePath '.nvm'
         Set-NodeInstallLocation -Path $installLocation
     }
 
@@ -210,8 +260,10 @@ Describe "Install-NodeVersion" {
 
 Describe "Set-NodeVersion" {
     InModuleScope nvm {
-        Context "auto-discovery" {
+        BeforeEach {
             $nodeVersion = 'v9.0.0'
+        }
+        Context "auto-discovery" {
 
             It "Will set from the .nvmrc file" {
                 $tmpDir = [system.io.path]::GetTempPath()
@@ -243,6 +295,19 @@ Describe "Set-NodeVersion" {
                 $infos | Should -Be "Switched to node version v9.1.0"
             }
 
+            It "Will set from the default file" {
+                $tmpDir = [system.io.path]::GetTempPath()
+                $nvmDir = Join-Path $tmpDir '.nvm'
+                Mock Test-Path { return $false } -ParameterFilter { $Path.Contains('.nvmrc') }
+                Mock Test-Path { return $false } -ParameterFilter { $Path.Contains('./package.json') }
+                Mock Test-Path { return $true } -ParameterFilter { $Path.Contains((Join-Path $nvmDir 'default')) }
+                Mock Get-Content -ParameterFilter { $Path -match 'default$' } { return $nodeVersion }
+                Mock Get-NodeInstallLocation { return $nvmDir }
+
+                Set-NodeVersion -InformationVariable infos
+                $infos | Should -Be "Switched to node version $nodeVersion"
+            }
+
             It "Will error if no version in the package.json field" {
                 Mock Test-Path -ParameterFilter { $Path.StartsWith('variable') -eq $false } {
                     return (-not ($Path -match '\.nvmrc$'))
@@ -254,22 +319,20 @@ Describe "Set-NodeVersion" {
                     } | ConvertTo-Json
                 }
 
-                { Set-NodeVersion } | Should Throw
+                { Set-NodeVersion } | Should -Throw
             }
 
-            It "Will error if no version, no .nvmrc and no package.json" {
-                Mock Test-Path -ParameterFilter { $Path.Contains('.nvmrc') } {
-                    return $false
-                }
+            It "Will error if no version, no .nvmrc and no package.json, no default" {
+                Mock Get-NodeInstallLocation { return "/" }
+                Mock Test-Path { return $false } -ParameterFilter { $Path -eq (Join-Path (Get-NodeInstallLocation) 'default') }
+                Mock Test-Path { return $false } -ParameterFilter { $Path.Contains('.nvmrc') }
                 Mock Test-Path { return $false } -ParameterFilter { $Path.Contains('./package.json') }
 
-                { Set-NodeVersion } | Should Throw "Version not given and no .nvmrc or package.json found in folder"
+                { Set-NodeVersion } | Should -Throw "Version not given, no .nvmrc found in folder, and package.json missing or does not contain node engines field"
             }
         }
 
         Context "Set from version string" {
-            $nodeVersion = 'v9.0.0'
-
             It "Will set from the supplied version" {
                 Set-NodeVersion $nodeVersion -InformationVariable infos
                 $infos | Should -Be "Switched to node version $nodeVersion"
@@ -301,7 +364,7 @@ Describe "Set-NodeVersion" {
                 Mock Get-NodeVersions { return @('v9.0.0') }
 
                 Set-NodeVersion 'v9' -InformationVariable infos
-                $env:NPM_CONFIG_GLOBALCONFIG | Should -not -Be $null
+                $env:NPM_CONFIG_GLOBALCONFIG | Should -Not -Be $null
             }
 
             It "Will update environment path" {
@@ -319,6 +382,39 @@ Describe "Set-NodeVersion" {
                 $tmpDir = [system.io.path]::GetTempPath()
                 Mock Get-NodeInstallLocation { return Join-Path $tmpDir '.nvm' }
                 Mock Test-Path { return $true } -ParameterFilter { $Path.StartsWith((Join-Path $tmpDir '.nvm')) -eq $true }
+            }
+        }
+
+        Context "pipeline" {
+            BeforeEach {
+                $nodeVersion = "v9.0.0"
+                Mock Test-Path -ParameterFilter { $Path -match 'vs' } { return $true }
+                Mock Get-ChildItem {
+                    [PSCustomObject]@{
+                        Name = 'v9.0.0'
+                        Path = "$Path\v9.0.0"
+                    }
+                }
+                Mock Get-ChildItem -ParameterFilter { $Filter -match 'node' } {
+                    [PSCustomObject]@{
+                        Name        = 'node.exe'
+                        VersionInfo = [PSCustomObject]@{
+                            ProductVersion = ( Split-Path -Path $Path -Leaf ).Replace('v', '')
+                        }
+                    }
+                }
+            }
+            It "Will set from the supplied version via Install-NodeVersion pipeline output" {
+                [PSCustomObject]@{
+                    Name    = 'node.exe'
+                    Version = '9.0.0'
+                } | Set-NodeVersion -InformationVariable infos
+                $infos | Should -Be "Switched to node version $nodeVersion"
+            }
+
+            It "Will set from the supplied version via Get-NodeVersion pipeline output" {
+                [SemVer.Version]::new($nodeVersion, $true) | Set-NodeVersion -InformationVariable infos
+                $infos | Should -Be "Switched to node version $nodeVersion"
             }
         }
     }
@@ -344,6 +440,34 @@ Describe "Remove-NodeVersion" {
             Assert-MockCalled -CommandName Remove-Item -Times 1 -ParameterFilter { $Path -eq (Join-Path $tmpDir 'v9.0.0') }
         }
 
+        It "Should remove multiple versions" {
+            $tmpDir = [system.io.path]::GetTempPath()
+            Mock Get-NodeInstallLocation { return $tmpDir }
+            Mock Test-Path { return $true }
+            Mock Remove-Item { }
+
+            Remove-NodeVersion 'v9.0.0', 'v10.0.0'
+
+            Assert-MockCalled -CommandName Remove-Item -Times 1 -ParameterFilter { $Path -eq (Join-Path $tmpDir 'v9.0.0') }
+            Assert-MockCalled -CommandName Remove-Item -Times 1 -ParameterFilter { $Path -eq (Join-Path $tmpDir 'v10.0.0') }
+        }
+
+        It "Should remove versions passed from the pipeline" {
+            $tmpDir = [system.io.path]::GetTempPath()
+            Mock Get-NodeInstallLocation { return $tmpDir }
+            Mock Test-Path { return $true }
+            Mock Remove-Item { }
+            Mock Get-NodeVersions {
+                'v9.0.0'
+                'v10.0.0'
+            }
+
+            Get-NodeVersions | Remove-NodeVersion
+
+            Assert-MockCalled -CommandName Remove-Item -Times 1 -ParameterFilter { $Path -eq (Join-Path $tmpDir 'v9.0.0') }
+            Assert-MockCalled -CommandName Remove-Item -Times 1 -ParameterFilter { $Path -eq (Join-Path $tmpDir 'v10.0.0') }
+        }
+
         It "Should throw when version doesn't exist" {
             $tmpDir = [system.io.path]::GetTempPath()
             Mock Get-NodeInstallLocation { return $tmpDir }
@@ -351,7 +475,7 @@ Describe "Remove-NodeVersion" {
             Mock Remove-Item { }
 
             $version = 'v9.0.0'
-            { Remove-NodeVersion $version } | Should -Throw "Could not find node version $version"
+ { Remove-NodeVersion $version } | Should -Throw "Could not find node version $version"
         }
     }
 }
